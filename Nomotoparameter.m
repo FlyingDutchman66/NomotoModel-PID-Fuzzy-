@@ -5,6 +5,10 @@
 %     Strategy A : fixed-gain PID heading loop       + fixed inner rudder loop
 %     Strategy B : Fuzzy Cascade PID (fuzzy-scheduled
 %                  outer PID gains)                   + the SAME inner loop
+%     Strategy C : MPC with fuzzy-scheduled weights   + the SAME inner loop
+%                  (constrained QP on the identified Nomoto model, solved with
+%                   Hildreth's method; the fuzzy layer sets the move-suppression
+%                   weight, i.e. how much rudder movement is allowed to cost)
 %
 %  Plant: first-order non-linear Nomoto model integrated with RK4, as in
 %  nomoto_zigzag_sim.m (Lan et al., J. Mar. Sci. Eng. 2023, 11, 903, Eq. 1).
@@ -81,6 +85,11 @@ A.encRes   = 0.1;       % [deg]   AS5600 resolution in rudder-equivalent degrees
 A.Kp       = 0.065;     % [duty/deg]
 A.Ki       = 0;         % [duty/(deg*s)] keep 0 with a rudder-side encoder:
                         %  integral action + backlash inside the loop -> hunting
+A.dzComp   = true;      % dead-zone inverse: add the break-away duty whenever the
+                        %  inner loop is asked to move more than dzBand. Without it
+                        %  small corrections are swallowed by static friction, which
+                        %  hurts any controller that makes small polite moves.
+A.dzBand   = 0.3;       % [deg] position error below which no compensation is added
 
 %% 3) SENSORS AND TIMING  ------------------------------------------------------
 S.Ts       = 0.1;       % [s]     outer (heading) loop period, 10 Hz
@@ -170,6 +179,40 @@ F.rulesKd = [     NM  NM  NM  NM  NM  NS  NS     % e = NB
                   PM  PS  ZO  NS  NS  NS  NS     % e = PM
                   NS  NS  NM  NM  NM  NM  NM ];  % e = PB
 
+% --- Strategy C: MPC with fuzzy-scheduled weights ------------------------------
+% Prediction model: the identified Nomoto model, linearised about the current
+% yaw rate and written in incremental form, so the decision variables are
+% RUDDER MOVES rather than rudder angles:
+%     x = [psi - psi_ref ; r ; delta_prev],   input du = delta - delta_prev
+%     cost J = q*sum_i (psi - psi_ref)_i^2  +  r_du*sum_j du_j^2
+%     s.t.  |du| <= rate_limit*Ts   and   |delta| <= dMax
+% Two things this buys over the PID: the belt drive's rudder-rate limit becomes
+% a CONSTRAINT the controller plans around instead of a surprise, and the
+% move-suppression weight r_du puts a direct price on actuator wear. Because
+% the plant contains an integrator, the incremental form also gives zero
+% steady-state error without a separate integrator state.
+MP.N     = 120;    % [-] prediction horizon (120 x 0.1 s = 12 s). Too short a
+                   %     horizon makes MPC overshoot badly on course changes.
+MP.Nc    = 12;     % [-] control horizon (number of free rudder moves). An
+                   %     integrating plant needs enough moves to plan the turn
+                   %     AND the straightening: with Nc = 5 this MPC under-drives
+                   %     course changes badly.
+MP.q     = 1;      % [-] tracking weight (only the ratio q/r_du matters)
+MP.rdu0  = 30;     % [-] base move-suppression weight: raise for a calmer,
+                   %     slower response, lower for a sharper one. Tune it so the
+                   %     MPC's rise time matches the PID's before comparing wear,
+                   %     otherwise you are comparing speed, not strategy.
+MP.cR    = 0.6;    % [-] fuzzy authority: r_du is scaled by 10^(-cR*u_p/3), so
+                   %     u_p = +3 (turn hard) divides it by 10^cR, and u_p = -3
+                   %     (hold course in waves) multiplies it by the same factor
+MP.Kobs  = 0.10;   % [-] input-disturbance observer gain (see mpcController).
+                   %     Needed for zero steady-state error: the dead zone and
+                   %     backlash mean the rudder the ship feels is not exactly
+                   %     the rudder the MPC commanded, and unlike a PID the MPC
+                   %     has no integrator of its own.
+MP.maxIter = 80;   % [-] Hildreth iterations
+MP.tol     = 1e-9; % [-] Hildreth convergence tolerance
+
 % Output universe discretisation for the centroid
 F.y     = -3:0.05:3;
 F.outMF = max(0, 1 - abs(F.y - (-3:3).'));     % 7 x numel(y), NB..PB
@@ -215,18 +258,19 @@ scn(3).speed  = [0 0; 50 0; 60 1];
 scn(3).band   = 2;
 scn(3).nSeeds = 3;
 
-ctrlNames = {'PID', 'Fuzzy-PID'};
+ctrlNames = {'PID', 'Fuzzy-PID', 'Fuzzy-MPC'};
+nC        = numel(ctrlNames);
 
 %% 7) RUN ALL SCENARIOS  -------------------------------------------------------
 res = cell(numel(scn), 1);
 tic;
 for iS = 1:numel(scn)
-    res{iS}.metrics = cell(scn(iS).nSeeds, 2);
-    res{iS}.log     = cell(1, 2);
+    res{iS}.metrics = cell(scn(iS).nSeeds, nC);
+    res{iS}.log     = cell(1, nC);
     for seed = 1:scn(iS).nSeeds
-        env = buildEnvironment(scn(iS), W, S, A, P, seed);   % shared by both strategies
-        for iC = 1:2
-            L = simulateRun(iC, env, A, S, C, F, g0);
+        env = buildEnvironment(scn(iS), W, S, A, P, seed);   % shared by all strategies
+        for iC = 1:nC
+            L = simulateRun(iC, env, A, S, C, F, g0, MP, P);
             res{iS}.metrics{seed, iC} = runMetrics(L, scn(iS));
             if seed == 1, res{iS}.log{iC} = L; end
         end
@@ -244,58 +288,68 @@ metricList = { 'IAE',       'IAE of heading error',   'deg*s'
 
 for iS = 1:numel(scn)
     fprintf('\n%s  (%d seed(s), mean +/- std)\n', scn(iS).name, scn(iS).nSeeds);
-    fprintf('%-34s %19s %19s %9s\n', 'Metric', ctrlNames{1}, ctrlNames{2}, 'Change');
+    fprintf('%-34s', 'Metric');
+    for iC = 1:nC, fprintf(' %19s', ctrlNames{iC}); end
+    fprintf('    vs PID\n');
     for q = 1:size(metricList, 1)
-        v = metricValues(res{iS}.metrics, metricList{q, 1});    % nSeeds x 2
-        m = mean(v, 1);  s = std(v, 0, 1);
-        fprintf('%-34s %9.3f +/- %-7.3f %9.3f +/- %-7.3f %+8.1f%%\n', ...
-            sprintf('%s [%s]', metricList{q, 2}, metricList{q, 3}), ...
-            m(1), s(1), m(2), s(2), 100*(m(2) - m(1))/m(1));
+        v = metricValues(res{iS}.metrics, metricList{q, 1});    % nSeeds x nC
+        m = mean(v, 1);  sd = std(v, 0, 1);
+        fprintf('%-34s', sprintf('%s [%s]', metricList{q, 2}, metricList{q, 3}));
+        for iC = 1:nC, fprintf(' %9.3f +/- %-7.3f', m(iC), sd(iC)); end
+        for iC = 2:nC, fprintf(' %+7.1f%%', 100*(m(iC) - m(1))/m(1)); end
+        fprintf('\n');
     end
     nSteps = size(scn(iS).ref, 1) - 1;
     for i = 1:nSteps
         dPsi = scn(iS).ref(i+1, 2) - scn(iS).ref(i, 2);
-        os = zeros(1, 2);  ts = zeros(1, 2);
-        for iC = 1:2
+        os = zeros(1, nC);  ts = zeros(1, nC);
+        for iC = 1:nC
             os(iC) = mean(cellfun(@(M) M.stepOS(i), res{iS}.metrics(:, iC)));
             ts(iC) = mean(cellfun(@(M) M.stepTs(i), res{iS}.metrics(:, iC)));
         end
-        fprintf('  Step %d (%+4.0f deg at t = %3.0f s): overshoot %5.1f%% vs %5.1f%%, settling (+/-%g deg) %5.1f s vs %5.1f s\n', ...
-            i, dPsi, scn(iS).ref(i+1, 1), os(1), os(2), scn(iS).band, ts(1), ts(2));
+        fprintf('  Step %d (%+4.0f deg at t = %3.0f s): overshoot', i, dPsi, scn(iS).ref(i+1, 1));
+        fprintf(' %5.1f%%', os);
+        fprintf(' | settling (+/-%g deg)', scn(iS).band);
+        fprintf(' %5.1f s', ts);
+        fprintf('   [%s]\n', strjoin(ctrlNames, ', '));
     end
 end
-fprintf('\nChange = (Fuzzy-PID - PID)/PID. Negative is better for every metric listed.\n');
+fprintf('\nPercentages are relative to PID. Negative is better for every metric listed.\n');
 fprintf('Settling time NaN = never stayed inside the band before the next step.\n');
 
 %% 9) PLOTS  ------------------------------------------------------------------
-col = {[0.00 0.35 0.80], [0.85 0.20 0.10]};
+col = {[0.00 0.35 0.80], [0.85 0.20 0.10], [0.10 0.60 0.25]};
 
 % --- S1: course changes in calm water ------------------------------------------
 L1 = res{1}.log;
 figure('Name', 'S1 course changes', 'Color', 'w');
 subplot(3, 1, 1); hold on; grid on; box on;
 stairs(L1{1}.tO, L1{1}.ref, 'k--', 'LineWidth', 1.0);
-for iC = 1:2, plot(L1{iC}.t, L1{iC}.psi, 'Color', col{iC}, 'LineWidth', 1.3); end
+for iC = 1:nC, plot(L1{iC}.t, L1{iC}.psi, 'Color', col{iC}, 'LineWidth', 1.3); end
 ylabel('\psi [deg]'); title(scn(1).name);
 legend({'reference', ctrlNames{:}}, 'Location', 'eastoutside');
 subplot(3, 1, 2); hold on; grid on; box on;
-for iC = 1:2, plot(L1{iC}.t, L1{iC}.delta, 'Color', col{iC}, 'LineWidth', 1.1); end
+for iC = 1:nC, plot(L1{iC}.t, L1{iC}.delta, 'Color', col{iC}, 'LineWidth', 1.1); end
 ylabel('\delta [deg]'); title('Actual steering angle');
 legend(ctrlNames, 'Location', 'eastoutside');
 subplot(3, 1, 3); hold on; grid on; box on;
 plot(L1{2}.tO, L1{2}.gain, 'LineWidth', 1.1);
-ylabel('gain / base gain'); xlabel('Time [s]'); title('Fuzzy-scheduled gains (Strategy B)');
-legend({'K_p/K_{p0}', 'K_i/K_{i0}', 'K_d/K_{d0}'}, 'Location', 'eastoutside');
+plot(L1{3}.tO, L1{3}.mpcW, 'k--', 'LineWidth', 1.1);
+set(gca, 'YScale', 'log');
+ylabel('ratio to base value'); xlabel('Time [s]');
+title('Fuzzy-scheduled PID gains (B) and MPC move-suppression weight (C)');
+legend({'K_p/K_{p0}', 'K_i/K_{i0}', 'K_d/K_{d0}', 'r_{\Delta u}/r_{\Delta u,0}'}, ...
+    'Location', 'eastoutside');
 
 % --- S2: course keeping in waves ------------------------------------------------
 L2 = res{2}.log;
 figure('Name', 'S2 course keeping in waves', 'Color', 'w');
 subplot(3, 1, 1); hold on; grid on; box on;
-for iC = 1:2, plot(L2{iC}.tO, L2{iC}.e, 'Color', col{iC}, 'LineWidth', 1.1); end
+for iC = 1:nC, plot(L2{iC}.tO, L2{iC}.e, 'Color', col{iC}, 'LineWidth', 1.1); end
 ylabel('e [deg]'); title([scn(2).name ' (seed 1)']);
 legend(ctrlNames, 'Location', 'eastoutside');
 subplot(3, 1, 2); hold on; grid on; box on;
-for iC = 1:2, plot(L2{iC}.t, L2{iC}.delta, 'Color', col{iC}, 'LineWidth', 1.0); end
+for iC = 1:nC, plot(L2{iC}.t, L2{iC}.delta, 'Color', col{iC}, 'LineWidth', 1.0); end
 ylabel('\delta [deg]'); title('Actual steering angle');
 legend(ctrlNames, 'Location', 'eastoutside');
 subplot(3, 1, 3); hold on; grid on; box on;
@@ -308,11 +362,11 @@ L3 = res{3}.log;
 figure('Name', 'S3 speed change', 'Color', 'w');
 subplot(3, 1, 1); hold on; grid on; box on;
 stairs(L3{1}.tO, L3{1}.ref, 'k--', 'LineWidth', 1.0);
-for iC = 1:2, plot(L3{iC}.t, L3{iC}.psi, 'Color', col{iC}, 'LineWidth', 1.2); end
+for iC = 1:nC, plot(L3{iC}.t, L3{iC}.psi, 'Color', col{iC}, 'LineWidth', 1.2); end
 ylabel('\psi [deg]'); title([scn(3).name ' (seed 1)']);
 legend({'reference', ctrlNames{:}}, 'Location', 'eastoutside');
 subplot(3, 1, 2); hold on; grid on; box on;
-for iC = 1:2, plot(L3{iC}.t, L3{iC}.delta, 'Color', col{iC}, 'LineWidth', 1.0); end
+for iC = 1:nC, plot(L3{iC}.t, L3{iC}.delta, 'Color', col{iC}, 'LineWidth', 1.0); end
 ylabel('\delta [deg]'); title('Actual steering angle');
 legend(ctrlNames, 'Location', 'eastoutside');
 subplot(3, 1, 3); hold on; grid on; box on;
@@ -342,7 +396,7 @@ keyM   = {'IAE', 'rudRate', 'revPerMin'};
 keyLab = {'IAE [deg s]', 'Mean rudder rate [deg/s]', 'Rudder reversals [1/min]'};
 figure('Name', 'Summary', 'Color', 'w', 'Position', [100 100 1100 380]);
 for q = 1:numel(keyM)
-    Y = zeros(numel(scn), 2);
+    Y = zeros(numel(scn), nC);
     for iS = 1:numel(scn)
         Y(iS, :) = mean(metricValues(res{iS}.metrics, keyM{q}), 1);
     end
@@ -354,15 +408,18 @@ for q = 1:numel(keyM)
 end
 
 %% 10) SAVE  -------------------------------------------------------------------
-save('controller_comparison_results.mat', 'res', 'scn', 'P', 'A', 'S', 'C', 'F', 'W', 'g0');
+save('controller_comparison_results.mat', 'res', 'scn', 'P', 'A', 'S', 'C', 'F', 'W', 'g0', 'MP');
 fprintf('Saved controller_comparison_results.mat\n');
 
 %% ========================================================================
 %  LOCAL FUNCTIONS
 %% ========================================================================
 
-function L = simulateRun(iC, env, A, S, C, F, g0)
-% One closed-loop run.  iC = 1: fixed-gain PID,  iC = 2: fuzzy-scheduled PID.
+function L = simulateRun(iC, env, A, S, C, F, g0, MP, P)
+% One closed-loop run.
+%   iC = 1: fixed-gain PID
+%   iC = 2: fuzzy-scheduled PID
+%   iC = 3: MPC with a fuzzy-scheduled move-suppression weight
     dt    = A.dt;
     nOut  = round(S.Ts/dt);              % inner steps per outer update
     N     = numel(env.t);
@@ -377,7 +434,10 @@ function L = simulateRun(iC, env, A, S, C, F, g0)
     dr0   = env.PV(1, 4);
     x     = [env.refO(1); 0; -dr0; 0];   % [psi; r; theta_m; omega_m]
     delta = -dr0;                        % rudder angle after the backlash
-    ctl.I = -dr0;                        % outer integrator state [deg]
+    ctl.I     = -dr0;                    % outer integrator state [deg]
+    ctl.dPrev = -dr0;                    % last rudder command (MPC state)
+    ctl.dHat  = 0;                       % MPC input-disturbance estimate [deg]
+    ctl.rPred = 0;                       % MPC one-step yaw-rate prediction [deg/s]
     rf    = 0;                           % filtered yaw rate [deg/s]
     queue = repmat(-dr0, 1, S.delay + 1);% outer-loop delay line
     dRef  = -dr0;                        % rudder reference for the inner loop
@@ -388,6 +448,7 @@ function L = simulateRun(iC, env, A, S, C, F, g0)
     L.t = env.t;   L.tO = env.tO;   L.ref = env.refO;
     L.psi = zeros(N, 1);  L.r = zeros(N, 1);  L.delta = zeros(N, 1);  L.u = zeros(N, 1);
     L.e = zeros(NO, 1);   L.dRef = zeros(NO, 1);  L.gain = ones(NO, 3);
+    L.mpcW = ones(NO, 1);                % MPC move-suppression weight ratio
     L.dist = env.dist;    L.KT = env.PV(:, 1:2);
 
     j = 0;
@@ -407,7 +468,15 @@ function L = simulateRun(iC, env, A, S, C, F, g0)
                 g.Ki = g0.Ki*(1 + F.ci*du(2)/3);
                 g.Kd = g0.Kd*(1 + F.cd*du(3)/3);
             end
-            [dNew, ctl] = headingPID(e, rf, g, ctl, C.dMax, S.Ts);
+            if iC <= 2
+                [dNew, ctl] = headingPID(e, rf, g, ctl, C.dMax, S.Ts);
+            else                                        % Strategy C: fuzzy-weighted MPC
+                du      = fuzzyGainAdjust(e, -rf, F);
+                wRatio  = 10^(-MP.cR*du(1)/3);          % aggressive -> cheaper rudder moves
+                [dNew, ctl] = mpcController(e, rf, ctl, MP, P.lo, S.Ts, ...
+                                            C.dMax, A.wMax*S.Ts, wRatio);
+                L.mpcW(j) = wRatio;
+            end
 
             queue = [queue(2:end) dNew];                % S.delay-sample delay
             dRef  = queue(1);
@@ -422,6 +491,9 @@ function L = simulateRun(iC, env, A, S, C, F, g0)
         posM = A.encRes*round(pos/A.encRes);            % AS5600 quantisation
         eIn  = dRef - posM;
         uIn  = A.Kp*eIn + uInI;
+        if A.dzComp && abs(eIn) > A.dzBand              % dead-zone inverse
+            uIn = uIn + sign(uIn)*A.uDead;
+        end
         u    = min(max(uIn, -1), 1);                    % BTS7960 duty limit
         if A.Ki > 0 && u == uIn                         % inner anti-windup
             uInI = uInI + A.Ki*eIn*dt;
@@ -455,6 +527,98 @@ function [dCmd, ctl] = headingPID(e, rf, g, ctl, dMax, Ts)
     if dCmd == uUnsat || sign(e) ~= sign(uUnsat)
         ctl.I = min(max(ctl.I + g.Ki*e*Ts, -dMax), dMax);
     end
+end
+
+function [dCmd, ctl] = mpcController(e, rf, ctl, MP, p, Ts, dMax, dUmax, wRatio)
+% Constrained MPC on the incremental Nomoto model.
+%   state   x = [psi - psi_ref ; r ; delta_prev]
+%   input   du = delta - delta_prev, the RUDDER MOVE this step
+%   model   linearised about the current yaw rate rf, because the cubic term
+%           makes the vessel less responsive the faster it is already turning:
+%               T_eff = T/(1 + 3*alpha*rf^2),  K_eff = K/(1 + 3*alpha*rf^2)
+%           and discretised exactly for the yaw-rate lag (trapezoid on psi).
+%   cost    q*sum(psi error)^2 + r_du*sum(du)^2, with r_du scaled by the fuzzy
+%           layer through wRatio.
+%   limits  |du| <= dUmax (the belt drive's rate limit over one sample) and
+%           |delta| <= dMax, both as hard QP constraints.
+    den = 1 + 3*p.alpha*rf^2;
+    Te  = p.T/den;
+    Ke  = p.K/den;
+    a   = exp(-Ts/Te);
+    b   = Ke*(1 - a);
+
+    % Input-disturbance observer: compare the yaw rate the model predicted for
+    % this instant with the one actually measured, and push the difference into
+    % an estimated rudder-equivalent bias dHat. This covers wind, current, the
+    % steering dead zone and backlash. Without it the MPC keeps a steady-state
+    % heading offset, because its model believes the rudder it commanded is the
+    % rudder the ship is feeling.
+    ctl.dHat = ctl.dHat + MP.Kobs*(rf - ctl.rPred)/max(Ke, eps);
+    ctl.dHat = min(max(ctl.dHat, -dMax), dMax);
+    dBias    = p.delta_r + ctl.dHat;            % total known + estimated bias
+
+    Ad  = [1, Ts/2*(1 + a), Ts/2*b
+           0, a,            b
+           0, 0,            1];
+    Bd  = [Ts/2*b; b; 1];
+    Ed  = [Ts/2*b*dBias; b*dBias; 0];
+    Cx  = [1 0 0];
+
+    N = MP.N;  Nc = MP.Nc;
+    Fm = zeros(N, 3);  Phi = zeros(N, Nc);  G = zeros(N, 1);
+    Sc = zeros(3, Nc);  off = zeros(3, 1);  Ak = eye(3);
+    for i = 1:N                                  % prediction matrices
+        Sc = Ad*Sc;
+        if i <= Nc, Sc(:, i) = Sc(:, i) + Bd; end
+        off = Ad*off + Ed;
+        Ak  = Ad*Ak;
+        Fm(i, :)  = Cx*Ak;
+        Phi(i, :) = Cx*Sc;
+        G(i)      = Cx*off;
+    end
+
+    x   = [-e; rf; ctl.dPrev];                   % e = psi_ref - psi
+    ep  = Fm*x + G;                              % free response of the heading error
+    rdu = MP.rdu0*wRatio;
+    H   = 2*(MP.q*(Phi.'*Phi) + rdu*eye(Nc));
+    f   = 2*MP.q*(Phi.'*ep);
+
+    Ltri = tril(ones(Nc));
+    Mc   = [eye(Nc); -eye(Nc); Ltri; -Ltri];
+    gam  = [dUmax*ones(2*Nc, 1)
+            (dMax - ctl.dPrev)*ones(Nc, 1)
+            (dMax + ctl.dPrev)*ones(Nc, 1)];
+
+    dU        = hildrethQP(H, f, Mc, gam, MP.maxIter, MP.tol);
+    dCmd      = min(max(ctl.dPrev + dU(1), -dMax), dMax);   % receding horizon
+    ctl.dPrev = dCmd;
+    ctl.rPred = a*rf + b*(dCmd + dBias);         % prediction for the next innovation
+end
+
+function x = hildrethQP(H, f, M, gam, maxIter, tol)
+% Hildreth's quadratic programming procedure:
+%     min 0.5*x'*H*x + f'*x   s.t.   M*x <= gam
+% Dual coordinate ascent with a non-negativity clamp on each multiplier. No
+% matrix factorisation beyond one small inverse, no toolbox, and the same code
+% runs on an STM32: with Nc = 5 this is a 5x5 inverse and a 20-variable dual.
+    Hinv = inv(H);
+    x    = -Hinv*f;                              % unconstrained solution
+    if all(M*x <= gam + 1e-9)
+        return;
+    end
+    Pm  = M*Hinv*M.';
+    d   = M*Hinv*f + gam;
+    n   = numel(gam);
+    lam = zeros(n, 1);
+    for it = 1:maxIter
+        lamPrev = lam;
+        for i = 1:n
+            w      = Pm(i, :)*lam - Pm(i, i)*lam(i);
+            lam(i) = max(0, -(w + d(i))/Pm(i, i));
+        end
+        if sum((lam - lamPrev).^2) < tol, break; end
+    end
+    x = -Hinv*(f + M.'*lam);
 end
 
 function du = fuzzyGainAdjust(e, ec, F)
