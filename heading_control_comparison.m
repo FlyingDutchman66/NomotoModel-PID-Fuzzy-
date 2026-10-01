@@ -5,10 +5,19 @@
 %     Strategy A : fixed-gain PID heading loop       + fixed inner rudder loop
 %     Strategy B : Fuzzy Cascade PID (fuzzy-scheduled
 %                  outer PID gains)                   + the SAME inner loop
-%     Strategy C : MPC with fuzzy-scheduled weights   + the SAME inner loop
+%     Strategy C : MPC with FIXED weights             + the SAME inner loop
+%     Strategy D : MPC with fuzzy WAVE-ACTIVITY weights + the SAME inner loop
+%     Strategy E : MPC with fixed weights set to D's AVERAGE weight
 %                  (constrained QP on the identified Nomoto model, solved with
-%                   Hildreth's method; the fuzzy layer sets the move-suppression
-%                   weight, i.e. how much rudder movement is allowed to cost)
+%                   Hildreth's method; in D the fuzzy layer sets the
+%                   move-suppression weight, i.e. how much rudder movement costs)
+%  C, D and E share the same model, horizons, sampling time, constraints and
+%  solver. The only difference is r_du. C holds it fixed; D schedules it; E holds
+%  it fixed at the geometric-mean value D actually used in that same run.
+%     D vs C tells you whether scheduling helps at all.
+%     D vs E tells you whether it helps for a reason OTHER than being more or
+%            less suppressive on average -- which is what the first version of
+%            this scheduler turned out to be doing.
 %
 %  Plant: first-order non-linear Nomoto model integrated with RK4, as in
 %  nomoto_zigzag_sim.m (Lan et al., J. Mar. Sci. Eng. 2023, 11, 903, Eq. 1).
@@ -179,7 +188,7 @@ F.rulesKd = [     NM  NM  NM  NM  NM  NS  NS     % e = NB
                   PM  PS  ZO  NS  NS  NS  NS     % e = PM
                   NS  NS  NM  NM  NM  NM  NM ];  % e = PB
 
-% --- Strategy C: MPC with fuzzy-scheduled weights ------------------------------
+% --- Strategies C and D: MPC (fixed weights) and MPC with fuzzy weights --------
 % Prediction model: the identified Nomoto model, linearised about the current
 % yaw rate and written in incremental form, so the decision variables are
 % RUDDER MOVES rather than rudder angles:
@@ -202,9 +211,55 @@ MP.rdu0  = 30;     % [-] base move-suppression weight: raise for a calmer,
                    %     slower response, lower for a sharper one. Tune it so the
                    %     MPC's rise time matches the PID's before comparing wear,
                    %     otherwise you are comparing speed, not strategy.
-MP.cR    = 0.6;    % [-] fuzzy authority: r_du is scaled by 10^(-cR*u_p/3), so
-                   %     u_p = +3 (turn hard) divides it by 10^cR, and u_p = -3
-                   %     (hold course in waves) multiplies it by the same factor
+% Strategy D only. Strategy C holds the weight at r_du0 (wRatio = 1), so the two
+% differ in nothing else and the pair is a clean ablation of the fuzzy layer.
+% WAVE-ACTIVITY SCHEDULING (Strategy D).
+% The first version of this scheduler read the heading error through the PID
+% rule table. It did nothing useful: during course keeping the error sits near
+% zero and the table is neutral, and during a turn the error saturates the
+% universe and the output pins to a constant. A single fixed weight imitated it
+% almost exactly. The scheduling input must instead distinguish CONDITIONS that
+% call for different weights, and wave activity is exactly such a condition:
+% in waves the rudder should be expensive (the yaw it fights is above the loop
+% bandwidth anyway), in calm water it should be cheap (so the boat settles).
+% Estimator: band-pass the measured yaw rate, then take a running RMS.
+%   fast low-pass (tauF) removes gyro noise, slow low-pass (tauS) removes the
+%   manoeuvring component, and the difference is what the waves are doing.
+% The two low-pass corners must BRACKET the wave encounter band, roughly
+% 2*pi/Tp rad/s. Too wide a band and the estimator counts things that are not
+% waves: with tauS = 5 s it read the backlash-driven hunting (0.3-0.6 rad/s) as
+% 1.2 deg/s of sea state in flat calm water. Set them from your measured Tp.
+MP.tauF  = 0.15;   % [s]   fast low-pass, corner ~6.7 rad/s (rejects gyro noise)
+MP.tauS  = 1.5;    % [s]   slow low-pass, corner ~0.67 rad/s (rejects manoeuvring
+                   %       and any slow limit cycle of the steering gear)
+MP.tauA  = 15.0;   % [s]   averaging time of the activity estimate
+% TWO calibration points, not one. The estimator cannot be normalised by a
+% single "typical" value, because the band it measures also contains the
+% steering gear's own hunting: on this plant it reads 1.0 deg/s in flat calm and
+% only 1.5 deg/s in the design sea state. Anchoring both ends spreads that narrow
+% range across the whole fuzzy universe. To calibrate: log the estimator while
+% holding course in calm water (aCalm) and in the sea state you care about
+% (aRough). Any pair of real recordings will do.
+MP.aCalm  = 1.0;   % [deg/s] estimator output while course keeping in calm water
+MP.aRough = 1.5;   % [deg/s] estimator output while course keeping in the design sea
+MP.eRef  = 20;     % [deg]   heading error that counts as a large course change
+MP.eGate = 5;      % [deg]   the activity estimate is FROZEN while |e| exceeds this.
+                   %         Without the gate a course change looks like rough
+                   %         water: the yaw-rate transient of a turn has energy in
+                   %         the wave band, and the scheduler then raises the weight
+                   %         exactly when the boat needs to move. Sea state is only
+                   %         measurable while holding course.
+MP.cW    = 0.6;    % [-] authority: r_du is scaled by 10^(cW*u_w/3), so the weight
+                   %     spans a factor of 10^cW each way between calm and rough
+MP.tauW  = 20.0;   % [s] the weight itself is slew-limited by a first-order lag in
+                   %     log space. The ablation showed that moving the weight
+                   %     DURING a manoeuvre hurts (it cheapens rudder moves at the
+                   %     start of a turn, then expensive ones during the settle,
+                   %     which is backwards), while choosing the right weight FOR
+                   %     THE CONDITIONS helps a lot. This lag keeps the second
+                   %     behaviour and removes the first. Set it well above the
+                   %     settling time and well below the time scale of sea-state
+                   %     changes. 0 disables the lag.
 MP.Kobs  = 0.10;   % [-] input-disturbance observer gain (see mpcController).
                    %     Needed for zero steady-state error: the dead zone and
                    %     backlash mean the rudder the ship feels is not exactly
@@ -217,6 +272,26 @@ MP.tol     = 1e-9; % [-] Hildreth convergence tolerance
 F.y     = -3:0.05:3;
 F.outMF = max(0, 1 - abs(F.y - (-3:3).'));     % 7 x numel(y), NB..PB
 
+% --- Rule table for the MPC move-suppression weight (Strategy D) ---------------
+% rows    = wave activity, NB = flat calm .. PB = much rougher than normal
+% columns = |heading error|, NB = on course .. PB = large course change
+% output  = how expensive rudder movement should be
+%           PB = very expensive (hold still, stop chasing waves)
+%           NB = very cheap (move freely, get on the new heading)
+% The diagonal is neutral: rough water and a big course change cancel out,
+% because you still have to turn the boat even when it is rough.
+%              |e|: NB  NM  NS  ZO  PS  PM  PB
+F.rulesWave = [     ZO  NS  NS  NM  NM  NB  NB     % activity = NB (flat calm)
+                    PS  ZO  NS  NS  NM  NM  NB     % NM
+                    PS  PS  ZO  NS  NS  NM  NM     % NS
+                    PM  PS  PS  ZO  NS  NS  NM     % ZO (normal sea state)
+                    PM  PM  PS  PS  ZO  NS  NS     % PS
+                    PB  PM  PM  PS  PS  ZO  NS     % PM
+                    PB  PB  PM  PM  PS  PS  ZO ];  % PB (much rougher)
+
+% Not point-symmetric by design: both of its axes are magnitudes (wave activity
+% and |e|), so there is no port/starboard mirror to respect.
+checkRuleTable(F.rulesWave, 'wave', false);
 checkRuleTable(F.rulesKp, 'Kp');
 checkRuleTable(F.rulesKi, 'Ki');
 checkRuleTable(F.rulesKd, 'Kd');
@@ -258,7 +333,7 @@ scn(3).speed  = [0 0; 50 0; 60 1];
 scn(3).band   = 2;
 scn(3).nSeeds = 3;
 
-ctrlNames = {'PID', 'Fuzzy-PID', 'Fuzzy-MPC'};
+ctrlNames = {'PID', 'Fuzzy-PID', 'MPC', 'Fuzzy-MPC', 'MPC@avg'};
 nC        = numel(ctrlNames);
 
 %% 7) RUN ALL SCENARIOS  -------------------------------------------------------
@@ -269,8 +344,12 @@ for iS = 1:numel(scn)
     res{iS}.log     = cell(1, nC);
     for seed = 1:scn(iS).nSeeds
         env = buildEnvironment(scn(iS), W, S, A, P, seed);   % shared by all strategies
+        wFix = 1;
         for iC = 1:nC
-            L = simulateRun(iC, env, A, S, C, F, g0, MP, P);
+            % Strategy E reuses the average weight Strategy D just used, so the
+            % two differ only in whether that weight moves during the run.
+            L = simulateRun(iC, env, A, S, C, F, g0, MP, P, wFix);
+            if iC == 4, wFix = 10^mean(log10(L.mpcW)); end
             res{iS}.metrics{seed, iC} = runMetrics(L, scn(iS));
             if seed == 1, res{iS}.log{iC} = L; end
         end
@@ -299,6 +378,8 @@ for iS = 1:numel(scn)
         for iC = 2:nC, fprintf(' %+7.1f%%', 100*(m(iC) - m(1))/m(1)); end
         fprintf('\n');
     end
+    wg = mean(metricValues(res{iS}.metrics, 'wGeo'), 1);
+    fprintf('  Fuzzy-MPC average move-suppression weight: %.2f x the fixed value\n', wg(end));
     nSteps = size(scn(iS).ref, 1) - 1;
     for i = 1:nSteps
         dPsi = scn(iS).ref(i+1, 2) - scn(iS).ref(i, 2);
@@ -318,7 +399,7 @@ fprintf('\nPercentages are relative to PID. Negative is better for every metric 
 fprintf('Settling time NaN = never stayed inside the band before the next step.\n');
 
 %% 9) PLOTS  ------------------------------------------------------------------
-col = {[0.00 0.35 0.80], [0.85 0.20 0.10], [0.10 0.60 0.25]};
+col = {[0.00 0.35 0.80], [0.85 0.20 0.10], [0.45 0.45 0.45], [0.10 0.60 0.25], [0.60 0.30 0.70]};
 
 % --- S1: course changes in calm water ------------------------------------------
 L1 = res{1}.log;
@@ -334,7 +415,7 @@ ylabel('\delta [deg]'); title('Actual steering angle');
 legend(ctrlNames, 'Location', 'eastoutside');
 subplot(3, 1, 3); hold on; grid on; box on;
 plot(L1{2}.tO, L1{2}.gain, 'LineWidth', 1.1);
-plot(L1{3}.tO, L1{3}.mpcW, 'k--', 'LineWidth', 1.1);
+plot(L1{4}.tO, L1{4}.mpcW, 'k--', 'LineWidth', 1.1);
 set(gca, 'YScale', 'log');
 ylabel('ratio to base value'); xlabel('Time [s]');
 title('Fuzzy-scheduled PID gains (B) and MPC move-suppression weight (C)');
@@ -415,7 +496,7 @@ fprintf('Saved controller_comparison_results.mat\n');
 %  LOCAL FUNCTIONS
 %% ========================================================================
 
-function L = simulateRun(iC, env, A, S, C, F, g0, MP, P)
+function L = simulateRun(iC, env, A, S, C, F, g0, MP, P, wFix)
 % One closed-loop run.
 %   iC = 1: fixed-gain PID
 %   iC = 2: fuzzy-scheduled PID
@@ -443,12 +524,20 @@ function L = simulateRun(iC, env, A, S, C, F, g0, MP, P)
     dRef  = -dr0;                        % rudder reference for the inner loop
     uInI  = 0;                           % inner integrator state
     aRf   = S.Ts/(S.tauRf + S.Ts);       % yaw-rate low-pass coefficient
+    % Wave-activity estimator states (Strategy D)
+    aF    = S.Ts/(MP.tauF + S.Ts);
+    aS    = S.Ts/(MP.tauS + S.Ts);
+    aA    = S.Ts/(MP.tauA + S.Ts);
+    rFast = 0;  rSlow = 0;  actVar = 0;
+    aW    = 1;  logW = 0;                % scheduled-weight lag (log domain)
+    if MP.tauW > 0, aW = S.Ts/(MP.tauW + S.Ts); end
 
     % --- Logs --------------------------------------------------------------------
     L.t = env.t;   L.tO = env.tO;   L.ref = env.refO;
     L.psi = zeros(N, 1);  L.r = zeros(N, 1);  L.delta = zeros(N, 1);  L.u = zeros(N, 1);
     L.e = zeros(NO, 1);   L.dRef = zeros(NO, 1);  L.gain = ones(NO, 3);
     L.mpcW = ones(NO, 1);                % MPC move-suppression weight ratio
+    L.act  = zeros(NO, 1);               % estimated wave-induced yaw activity [deg/s]
     L.dist = env.dist;    L.KT = env.PV(:, 1:2);
 
     j = 0;
@@ -470,9 +559,33 @@ function L = simulateRun(iC, env, A, S, C, F, g0, MP, P)
             end
             if iC <= 2
                 [dNew, ctl] = headingPID(e, rf, g, ctl, C.dMax, S.Ts);
-            else                                        % Strategy C: fuzzy-weighted MPC
-                du      = fuzzyGainAdjust(e, -rf, F);
-                wRatio  = 10^(-MP.cR*du(1)/3);          % aggressive -> cheaper rudder moves
+            else
+                % Wave-activity estimate: band-pass the measured yaw rate, then
+                % take its running RMS. Updated for every MPC strategy so the
+                % logged signal is comparable, but only used by Strategy D.
+                rFast  = rFast + aF*(rM - rFast);
+                rSlow  = rSlow + aS*(rM - rSlow);
+                rBp    = rFast - rSlow;
+                if abs(e) < MP.eGate                    % hold the estimate in turns
+                    actVar = actVar + aA*(rBp^2 - actVar);
+                end
+                waveAct = sqrt(actVar);
+                L.act(j) = waveAct;
+
+                switch iC
+                    case 3                              % fixed weights
+                        wRatio = 1;
+                    case 4                              % fuzzy wave-activity scheduling
+                        % calm -> -3, design sea state -> +3, midpoint -> 0
+                        an = 3*(2*(waveAct - MP.aCalm)/(MP.aRough - MP.aCalm) - 1);
+                        an = min(max(an, -3), 3);
+                        en = min(max(3*(2*abs(e)/MP.eRef - 1), -3), 3);
+                        wTarget = MP.cW*fuzzyOne(an, en, F.rulesWave, F)/3;
+                        logW    = logW + aW*(wTarget - logW);   % slew-limited
+                        wRatio  = 10^logW;
+                    otherwise                           % fixed at D's average weight
+                        wRatio = wFix;
+                end
                 [dNew, ctl] = mpcController(e, rf, ctl, MP, P.lo, S.Ts, ...
                                             C.dMax, A.wMax*S.Ts, wRatio);
                 L.mpcW(j) = wRatio;
@@ -623,25 +736,28 @@ end
 
 function du = fuzzyGainAdjust(e, ec, F)
 % Mamdani fuzzy inference: (e, ec) -> [u_p u_i u_d], each in [-3, 3].
-% Only the (at most 4) rules with non-zero firing strength are evaluated.
     en  = min(max(F.Ke*e,  -3), 3);
     ecn = min(max(F.Kec*ec, -3), 3);
-    me  = triMF7(en);
-    mec = triMF7(ecn);
-    ie  = find(me  > 0);
-    iec = find(mec > 0);
-    R   = {F.rulesKp, F.rulesKi, F.rulesKd};
-    du  = zeros(1, 3);
-    for q = 1:3
-        agg = zeros(size(F.y));
-        for i = ie
-            for jj = iec
-                w   = min(me(i), mec(jj));                          % AND = min
-                agg = max(agg, min(w, F.outMF(R{q}(i, jj) + 4, :)));% implication min, aggregation max
-            end
+    du  = [fuzzyOne(en, ecn, F.rulesKp, F), ...
+           fuzzyOne(en, ecn, F.rulesKi, F), ...
+           fuzzyOne(en, ecn, F.rulesKd, F)];
+end
+
+function u = fuzzyOne(x1n, x2n, R, F)
+% One Mamdani inference on one 7x7 rule table. Inputs are already normalised to
+% [-3, 3]. Min for AND and implication, max for aggregation, centroid to
+% defuzzify. Only the (at most 4) rules with non-zero firing strength are
+% evaluated, which is what makes this cheap enough for an STM32.
+    m1 = triMF7(x1n);
+    m2 = triMF7(x2n);
+    agg = zeros(size(F.y));
+    for i = find(m1 > 0)
+        for jj = find(m2 > 0)
+            w   = min(m1(i), m2(jj));
+            agg = max(agg, min(w, F.outMF(R(i, jj) + 4, :)));
         end
-        du(q) = sum(F.y .* agg) / sum(agg);                         % centroid
     end
+    u = sum(F.y .* agg) / sum(agg);
 end
 
 function mu = triMF7(x)
@@ -772,6 +888,10 @@ function M = runMetrics(L, sc)
     M.rudRate   = sum(abs(diff(L.delta)))/Tt;           % mean steering speed = wear proxy
     M.revPerMin = countReversals(L.delta, 0.5)/(Tt/60); % direction changes > 0.5 deg
     M.effort    = sum(L.u.^2)*dt;                       % motor effort proxy
+    M.wGeo      = 10^mean(log10(L.mpcW));               % geometric-mean MPC weight
+                                                        % ratio: 1 means the fuzzy
+                                                        % layer was, on average, as
+                                                        % aggressive as fixed weights
     % Step-response metrics for every setpoint change
     nSteps   = size(sc.ref, 1) - 1;
     M.stepOS = nan(1, nSteps);
@@ -819,11 +939,13 @@ function v = metricValues(Mcell, name)
     v = cellfun(@(M) M.(name), Mcell);
 end
 
-function checkRuleTable(R, name)
-% Sanity checks for a pasted 7x7 rule table.
+function checkRuleTable(R, name, wantSym)
+% Sanity checks for a pasted 7x7 rule table. wantSym (default true) asks for
+% point symmetry, which only applies when BOTH inputs are signed quantities.
+    if nargin < 3, wantSym = true; end
     assert(isequal(size(R), [7 7]), '%s rule table must be 7x7.', name);
     assert(all(ismember(R(:), -3:3)), '%s rule table entries must be NB..PB (-3..3).', name);
-    if ~isequal(R, rot90(R, 2))
+    if wantSym && ~isequal(R, rot90(R, 2))
         warning(['%s rule table is not point-symmetric (rule(e,ec) ~= rule(-e,-ec)): ' ...
             'turns to port and starboard will get different gains.'], name);
     end
